@@ -568,7 +568,7 @@ func TestCalculateChanges(t *testing.T) {
 			},
 		},
 		{
-			name: "process first 10 files",
+			name: "process all files",
 			setupMocks: func(parser *resources.MockParser, reader *repository.MockReader, progress *jobs.MockJobProgressRecorder, renderer *MockScreenshotRenderer, parserFactory *resources.MockParserFactory) {
 				finfo := &repository.FileInfo{
 					Path: "path/to/file.json",
@@ -633,10 +633,9 @@ func TestCalculateChanges(t *testing.T) {
 				return changes
 			}(),
 			expectedInfo: changeInfo{
-				SkippedFiles: 5,
 				Changes: func() []fileChangeInfo {
-					changes := make([]fileChangeInfo, 0, 10)
-					for range 10 {
+					changes := make([]fileChangeInfo, 0, 15)
+					for range 15 {
 						changes = append(changes, fileChangeInfo{
 							Change: repository.VersionedFileChange{
 								Action: repository.FileActionCreated,
@@ -1422,7 +1421,6 @@ func TestCalculateChanges(t *testing.T) {
 
 			require.NoError(t, err)
 			require.Equal(t, len(tt.expectedInfo.Changes), len(info.Changes))
-			require.Equal(t, tt.expectedInfo.SkippedFiles, info.SkippedFiles)
 
 			// compare change URLs
 			for i, change := range info.Changes {
@@ -1806,6 +1804,43 @@ func TestEvaluate_GitHubEnterpriseDoesNotPanic(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Len(t, info.Changes, 1)
+}
+
+// A canceled context must stop the loop before it touches any file -- reader/parser
+// mocks below have no expectations set, so a call past the cancellation check would
+// panic. This guards against burning through a large PR's file list (and filling the
+// comment with spurious "context canceled" errors) once the job's context expires.
+func TestEvaluate_StopsWhenContextIsCanceled(t *testing.T) {
+	reader := repository.NewMockReader(t)
+	reader.On("Config").Return(&provisioning.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-repo", Namespace: "x"},
+		Spec:       provisioning.RepositorySpec{Type: provisioning.GitHubRepositoryType},
+	})
+
+	parserFactory := resources.NewMockParserFactory(t)
+	parserFactory.On("GetParser", mock.Anything, mock.Anything).Return(resources.NewMockParser(t), nil)
+
+	renderer := NewMockScreenshotRenderer(t)
+	renderer.On("IsAvailable", mock.Anything).Return(false)
+
+	progress := jobs.NewMockJobProgressRecorder(t)
+
+	evaluator := NewEvaluator(renderer, parserFactory, URLProvider{
+		Internal: func(_ context.Context, _ string) string { return "http://host/" },
+		Public:   func(_ context.Context, _ string) string { return "http://host/" },
+	}, prometheus.NewPedanticRegistry())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	info, err := evaluator.Evaluate(ctx, reader, provisioning.PullRequestJobOptions{Ref: "ref"}, []repository.VersionedFileChange{
+		{Action: repository.FileActionCreated, Path: "a.json", Ref: "ref"},
+		{Action: repository.FileActionCreated, Path: "b.json", Ref: "ref"},
+		{Action: repository.FileActionCreated, Path: "c.json", Ref: "ref"},
+	}, progress)
+
+	require.NoError(t, err)
+	require.Empty(t, info.Changes, "canceled context should stop the loop before any file is evaluated")
 }
 
 func TestDummyImageURL(t *testing.T) {

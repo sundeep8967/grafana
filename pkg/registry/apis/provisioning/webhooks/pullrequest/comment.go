@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"text/template"
 
@@ -11,6 +12,11 @@ import (
 )
 
 const maxErrorLength = 256
+
+// maxDisplayedChanges caps how many rows the comment table renders. PR jobs now
+// process every changed file, but a very large PR would otherwise produce an
+// unreadably long comment.
+const maxDisplayedChanges = 10
 
 type commenter struct {
 	templateDashboard        *template.Template
@@ -61,7 +67,7 @@ func (c *commenter) generateComment(_ context.Context, info changeInfo) (string,
 		if err := c.templateTable.Execute(&buf, &info); err != nil {
 			return "", fmt.Errorf("unable to execute template: %w", err)
 		}
-		if info.HasErrors() {
+		if len(info.ErrorIndexes()) > 0 {
 			if err := c.templateValidationErrors.Execute(&buf, &info); err != nil {
 				return "", fmt.Errorf("unable to execute validation errors template: %w", err)
 			}
@@ -123,18 +129,21 @@ const commentTemplateSingleDashboard = `{{define "title"}}{{if .SourceURL}}[**{{
 {{- end}}
 `
 
-const commentTemplateTable = `📋 Grafana detected **{{.TotalChanges}}** resource change{{if ne .TotalChanges 1}}s{{end}} in this pull request{{- if .HasErrors}} — ⚠️ {{.ErrorCount}} need{{if eq .ErrorCount 1}}s{{end}} attention{{- end}}.
+const commentTemplateTable = `📋 Grafana detected **{{.TotalChanges}}** resource change{{if ne .TotalChanges 1}}s{{end}} in this pull request{{- if gt (len .ErrorIndexes) 0}} — ⚠️ {{len .ErrorIndexes}} need{{if eq (len .ErrorIndexes) 1}}s{{end}} attention{{- end}}.
+
+**By action:** {{range $i, $e := .ActionCounts}}{{if $i}}, {{end}}{{$e.Label}} ({{$e.Count}}){{end}}
+**By kind:** {{range $i, $e := .KindCounts}}{{if $i}}, {{end}}{{$e.Label}} ({{$e.Count}}){{end}}
+{{- if gt .TotalChanges .DisplayedCount}}
+
+{{.DisplayedCount}} / {{.TotalChanges}} change details shown below
+{{- end}}
 
 | Action | Kind | Resource | File | Preview | Status |
 |--------|------|----------|------|---------|--------|
-{{- range .Changes}}
+{{- range .DisplayedChanges}}
 | {{.ActionLabel}} | {{.Kind}} | {{.ExistingLink}} | {{ if .SourceURL}}[source]({{.SourceURL}}){{ else }}{{.SafeFilePath}}{{ end }} | {{ if .PreviewURL}}[preview]({{.PreviewURL}}){{ end }} | {{.StatusIcon}} |
 {{- end -}}
-{{- if .SkippedFiles}}
-
-and {{ .SkippedFiles }} more files.
-{{- end}}
-{{- if not .HasErrors}}
+{{- if eq (len .ErrorIndexes) 0}}
 
 All resources passed validation. ✅
 {{- end}}`
@@ -145,9 +154,13 @@ const commentTemplateValidationErrors = `
 
 | File | Error |
 |------|-------|
-{{- range .Changes}}{{ if .Error}}
+{{- range .ValidationIssues}}
 | ` + "`{{.Change.Path}}`" + ` | {{.TruncatedError}} |
-{{- end}}{{ end}}
+{{- end}}
+{{- if gt .HiddenErrorCount 0}}
+
+{{.HiddenErrorCount}} more error{{if ne .HiddenErrorCount 1}}s{{end}} not displayed
+{{- end}}
 `
 
 // TODO(ferruvich): let's discuss this text with the team
@@ -276,15 +289,6 @@ func (c changeInfo) SafeRepositoryTitle() string {
 	return escapeMarkdown(c.RepositoryTitle)
 }
 
-func (c *changeInfo) HasErrors() bool {
-	for i := range c.Changes {
-		if c.Changes[i].Error != "" {
-			return true
-		}
-	}
-	return false
-}
-
 func (c *changeInfo) HasRemovedMetadataChanges() bool {
 	for i := range c.Changes {
 		if c.Changes[i].HasRemovedMetadata {
@@ -298,12 +302,104 @@ func (c *changeInfo) TotalChanges() int {
 	return len(c.Changes)
 }
 
-func (c *changeInfo) ErrorCount() int {
-	n := 0
+// DisplayedChanges returns the changes rendered as table rows, capped at
+// maxDisplayedChanges.
+func (c *changeInfo) DisplayedChanges() []fileChangeInfo {
+	if len(c.Changes) <= maxDisplayedChanges {
+		return c.Changes
+	}
+	return c.Changes[:maxDisplayedChanges]
+}
+
+func (c *changeInfo) DisplayedCount() int {
+	return len(c.DisplayedChanges())
+}
+
+// ErrorIndexes returns the indexes into Changes of every change that failed
+// (has a non-empty Error).
+func (c *changeInfo) ErrorIndexes() []int {
+	var indexes []int
 	for i := range c.Changes {
 		if c.Changes[i].Error != "" {
-			n++
+			indexes = append(indexes, i)
 		}
 	}
-	return n
+	return indexes
+}
+
+// ValidationIssues returns the changes that failed, capped at maxDisplayedChanges
+// (the first 10 entries from ErrorIndexes), for the validation issues table.
+func (c *changeInfo) ValidationIssues() []fileChangeInfo {
+	indexes := c.ErrorIndexes()
+	if len(indexes) > maxDisplayedChanges {
+		indexes = indexes[:maxDisplayedChanges]
+	}
+
+	issues := make([]fileChangeInfo, 0, len(indexes))
+	for _, i := range indexes {
+		issues = append(issues, c.Changes[i])
+	}
+	return issues
+}
+
+// HiddenErrorCount returns how many failed changes are not shown in
+// ValidationIssues because the table is capped at maxDisplayedChanges.
+func (c *changeInfo) HiddenErrorCount() int {
+	return len(c.ErrorIndexes()) - len(c.ValidationIssues())
+}
+
+type countEntry struct {
+	Label string
+	Count int
+}
+
+// actionLabelOrder mirrors the case order in fileChangeInfo.ActionLabel, so the
+// per-action breakdown reads in the same create/update/delete/move/rename/ignore
+// sequence reviewers already see in the table above it.
+var actionLabelOrder = []string{"➕ Added", "✏️ Updated", "🗑️ Deleted", "➡️ Moved", "📝 Renamed", "🚫 Ignored"}
+
+// ActionCounts groups Changes by ActionLabel and counts files in each group.
+func (c *changeInfo) ActionCounts() []countEntry {
+	counts := map[string]int{}
+	for i := range c.Changes {
+		counts[c.Changes[i].ActionLabel()]++
+	}
+	return orderedCounts(counts, actionLabelOrder)
+}
+
+// KindCounts groups Changes by resource kind (info.Parsed.GVK.Kind) and counts
+// files in each group.
+func (c *changeInfo) KindCounts() []countEntry {
+	counts := map[string]int{}
+	for i := range c.Changes {
+		counts[c.Changes[i].Kind()]++
+	}
+	return orderedCounts(counts, nil)
+}
+
+// orderedCounts returns one countEntry per label in counts: labels listed in
+// priority come first in that order, followed by any remaining labels sorted
+// alphabetically.
+func orderedCounts(counts map[string]int, priority []string) []countEntry {
+	var entries []countEntry
+	seen := make(map[string]bool, len(priority))
+	for _, label := range priority {
+		if n, ok := counts[label]; ok {
+			entries = append(entries, countEntry{Label: label, Count: n})
+			seen[label] = true
+		}
+	}
+
+	rest := make([]string, 0, len(counts)-len(seen))
+	for label := range counts {
+		if !seen[label] {
+			rest = append(rest, label)
+		}
+	}
+	sort.Strings(rest)
+	for _, label := range rest {
+		entries = append(entries, countEntry{Label: label, Count: counts[label]})
+	}
+
+	return entries
 }
